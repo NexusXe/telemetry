@@ -1,13 +1,17 @@
 #![cfg_attr(not(test), no_std)]
 #![feature(const_trait_impl)]
 #![feature(ascii_char)]
-#![feature(const_option)]
 
 #[derive(Debug)]
 pub enum NmeaParseError {
     InvalidInputError(u8),
     ImpossibleMessageTypeError([u8; 3]),
     SectionParseError,
+    MessageTooLongError(usize),
+    IllegalCharacterError(u8),
+    MalformedPrefixError([u8; 8]),
+    MalformedSuffixError([u8; 8]),
+    ChecksumError { expected: u8, actual: u8 },
 }
 
 pub enum NmeaMessageType {
@@ -26,6 +30,71 @@ pub struct RawNmeaMessage {
 }
 
 impl RawNmeaMessage {
+    pub fn new<const STRICT: bool>(input: &[u8]) -> Result<Self, NmeaParseError> { // should STRICT be a generic parameter?
+        fn first_non_ascii_byte(slice: &[u8]) -> u8 {
+            for &byte in slice {
+                if byte >= 128 {
+                    return byte;
+                }
+            }
+            unreachable!()
+        }
+
+        if !input.is_ascii() {
+            return Err(NmeaParseError::InvalidInputError(first_non_ascii_byte(
+                input,
+            )));
+        } // is the input all valid ASCII?
+
+        if input.len() > Self::NMEA_BUFFER_SIZE {
+            // is the input a reasonable (valid) size?
+            return Err(NmeaParseError::MessageTooLongError(input.len()));
+        }
+
+        // does the message start as we would expect?
+        const PREFIX_MASK: u64 = u64::from_be_bytes(*b"$GP\0\0\0,\0");
+        const FIXED_PREFIX_CHARS: u64 = 0xFFFFFF000000FF00;
+        let mut prefix_bytes: [u8; 8] = [0u8; 8];
+        prefix_bytes.copy_from_slice(&input[..8]);
+        let prefix_check: u64 =
+            (u64::from_be_bytes(prefix_bytes) ^ PREFIX_MASK) & FIXED_PREFIX_CHARS;
+        if prefix_check != 0 {
+            return Err(NmeaParseError::MalformedPrefixError(
+                prefix_check.to_be_bytes(),
+            ));
+        }
+
+        // does the message end as we would expect?
+        const SUFFIX_MASK: u64 = u64::from_be_bytes(*b"\0\0\0*\0\0\r\n");
+        const FIXED_SUFFIX_CHARS: u64 = 0x000000FF0000FFFF;
+        let mut suffix_bytes: [u8; 8] = [0u8; 8];
+        suffix_bytes.copy_from_slice(&input[(input.len() - 4)..]);
+        let suffix_check: u64 =
+            (u64::from_be_bytes(suffix_bytes) ^ SUFFIX_MASK) & FIXED_SUFFIX_CHARS;
+        if suffix_check != 0 {
+            return Err(NmeaParseError::MalformedSuffixError(
+                suffix_check.to_be_bytes(),
+            ));
+        }
+
+        // construct potential output struct (early so that we can verify its checksum)
+        let mut outbuf = [0u8; Self::NMEA_BUFFER_SIZE];
+        outbuf.copy_from_slice(input);
+        let output: Self = Self {
+            message: outbuf,
+            length: input.len(),
+        };
+
+        let checksum_is_valid: bool = output.verify_checksum()?;
+        if STRICT && !checksum_is_valid {
+            return Err(NmeaParseError::ChecksumError {
+                expected: output.get_checksum()?,
+                actual: output.calculate_checksum(),
+            });
+        }
+
+        Ok(output)
+    }
     const NMEA_BUFFER_SIZE: usize = 92;
     pub const fn r#type(&self) -> Result<NmeaMessageType, NmeaParseError> {
         let message_type_bytes: [u8; 3] = [self.message[3], self.message[4], self.message[5]];
@@ -94,8 +163,6 @@ pub struct CompactLocation {
     lng: [u8; 3],
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,4 +212,3 @@ mod tests {
         assert!(test_message.verify_checksum().unwrap())
     }
 }
-

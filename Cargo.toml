@@ -8,3 +8,5 @@ crate-type = ["lib"]
 
 [dependencies]
 h3o = "0.6.4"
+# zerocopy = "0.X"
+# zerocopy-derive = "0.X"
